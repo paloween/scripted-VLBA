@@ -1,0 +1,13 @@
+# Test dataset from the original notebook.
+vis: TL016B.ms
+fitsidi_files: [../test-data/TL016B.idifits]
+workdir: work
+refant: auto            # or e.g. "FD,PT"
+calibrate_delay: 4C39.25
+calibrate_bandpass: 4C39.25
+calibrate_phase: J1154+6022
+observe_target: J1203+6031
+sbd_timerange: "09:17:00~09:18:00"   # instrumental delay (step 7)
+# obs_freq_ghz: 1.6     # set to enable the ionosphere/troposphere regime check
+# overrides:
+#   fringefit: {solint: 60s}

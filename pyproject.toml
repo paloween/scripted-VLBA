@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vlbapipe"
+version = "0.1.0"
+description = "Scripted VLBA continuum calibration and imaging on top of CASA"
+requires-python = ">=3.10"
+dependencies = ["pyyaml"]
+
+[project.optional-dependencies]
+casa = ["casatasks", "casatools"]
+test = ["pytest"]
+
+[project.scripts]
+vlbapipe = "vlbapipe.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["vlbapipe*"]
+
+[tool.setuptools.package-data]
+vlbapipe = ["templates/*.py"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,8 @@
+.venv/
+tests/
+.pytest_cache/
+VLBA_DataReduction_Script_py.ipynb
+vlba_script_test.ipynb
+notes
+usno_finals.erp
+test-data/

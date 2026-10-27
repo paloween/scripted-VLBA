@@ -1,0 +1,762 @@
+# VLBA Continuum Data Reduction Script
+#
+# Modeled on the ALMA scriptForCalibration.py. Task calls are VLBI-appropriate
+# (importfitsidi, fringefit, accor, gencal eop/tsys/gc) rather than ALMA's
+# WVR/ASDM-specific calls.
+#
+# Run inside monolithic CASA, all steps:
+#   casa --nologger --nogui -c scriptForCalibration_VLBA.py
+# selected steps only (comma list and/or ranges):
+#   casa --nologger --nogui -c scriptForCalibration_VLBA.py --steps 3,4
+#   casa --nologger --nogui -c scriptForCalibration_VLBA.py --steps 13-17
+# or from the CASA prompt:
+#   mysteps = [3, 4]
+#   execfile('scriptForCalibration_VLBA.py', globals())
+# Pass globals(): CASA's execfile otherwise runs the script in its own
+# namespace, the script never sees mysteps, and ALL steps run.
+#
+# NOT science-ready: a first-pass calibration for checking detections and
+# spotting problems. Inspect every calibration table before trusting it.
+#
+# Maps onto the hiflb_* MVP stage list:
+#   hiflb_importdata  -> steps 0-1
+#   hiflb_priorcals   -> steps 2-5
+#   hiflb_fringefit   -> steps 6-8
+#   hiflb_bandpass    -> steps 9-11
+#   hiflb_applycal    -> steps 12-15
+#   hiflb_selfcal     -> step 16
+#   quicklook imaging -> step 17
+
+import os
+import re
+import subprocess
+import sys
+
+import numpy as np
+
+try:
+  # Modular CASA. In monolithic CASA the tasks are already in the namespace,
+  # and this import also succeeds.
+  from casatasks import *
+  from casatasks import casalog
+except ImportError:
+  pass
+from casatools import msmetadata
+from casatools import ms as mstool
+from casatools import quanta
+_qa = quanta()
+
+# ============================================================
+# Dataset-specific variables. Filled in by the script generator
+# (vlbapipe generate <config.yaml>); edit by hand otherwise.
+# ============================================================
+# --- BEGIN DATASET PARAMETERS ---
+vis = '<FILL IN>.ms'                  # output MS name after import
+fitsidi_files = ['<FILL IN>.idifits'] # FITS-IDI file(s) from the correlator
+antab_file = None                     # ANTAB file (Tsys/gain curve), if needed
+obs_freq_ghz = None                   # drives the opacity/ionosphere branch (step 3)
+workdir = '.'                         # all products are written here
+refant = '<FILL IN>'                  # e.g. 'FD' or 'FD,PT,LA'
+
+CALIBRATE_DELAY = '<FILL IN>'         # fringe finder
+CALIBRATE_BANDPASS = '<FILL IN>'      # usually the fringe finder too
+CALIBRATE_PHASE = '<FILL IN>'         # phase-referencing calibrator
+OBSERVE_TARGET = '<FILL IN>'          # science target
+
+quack_interval_s = 4.0                # flag this many seconds at scan start/end (step 2)
+tfcrop = True                         # automated tfcrop flagging (step 2)
+manual_flags = False                  # True: flag manual_flag_spw in step 2
+manual_flag_spw = ''                  # e.g. '0:0~3;124~127'
+sbd_timerange = ''                    # good ~1 min range for instrumental delay (step 7)
+antpos = False                        # antenna-position corrections (step 5)
+phase_ref_target = True               # self-cal the phase-ref cal and transfer to target (step 16)
+
+image_cell = 'auto'                   # imaging cell size, e.g. '0.2mas', or 'auto' (steps 16-17)
+image_imsize = 'auto'                 # imaging size in pixels, e.g. 640, or 'auto' (steps 16-17)
+quicklook_calibrators = False         # also make quicklook images of the calibrators (step 17)
+# --- END DATASET PARAMETERS ---
+
+# FITS-IDI paths are given relative to where CASA was started; resolve them
+# before moving into the working directory.
+if isinstance(fitsidi_files, str):
+  fitsidi_files = [fitsidi_files]
+fitsidi_files = [os.path.abspath(f) for f in fitsidi_files]
+os.makedirs(workdir, exist_ok=True)
+os.chdir(workdir)
+
+vis_pre = vis[:-3] if vis.endswith('.ms') else vis
+cal_vis = vis_pre + '_cal.ms'        # split output from step 15, input to steps 16-17
+target_vis = vis_pre + '_target.ms'  # self-calibrated science target from step 16
+
+step_title = {0: 'Import FITS-IDI data',
+              1: 'listobs and inspect metadata',
+              2: 'A priori flagging (quack, tfcrop, manual)',
+              3: 'EOP correction and opacity/ionosphere cal table (frequency-dependent)',
+              4: 'Autocorrelation, Tsys and gain-curve cal tables',
+              5: 'Generation of antenna position cal table',
+              6: 'Save flags before fringefit',
+              7: 'Instrumental Delay Calibration',
+              8: 'Global fringe fitting (delay + rate) on calibrators',
+              9: 'Apply priorcals + fringefit to calibrator(s)',
+              10: 'Save flags before bandpass cal',
+              11: 'Bandpass calibration',
+              12: 'Save flags before applycal',
+              13: 'Application of fringefit + bandpass cal tables to all fields',
+              14: 'Final amplitude scaling and flux calibration',
+              15: 'Split out calibrated data',
+              16: 'Self-Calibration of Science Target or Phase Reference Calibrator',
+              17: 'Quicklook imaging'}
+
+def parse_steps(spec):
+  """'1,3-5' -> [1, 3, 4, 5]"""
+  steps = []
+  for part in spec.split(','):
+    if '-' in part:
+      lo, hi = part.split('-')
+      steps.extend(range(int(lo), int(hi) + 1))
+    elif part.strip():
+      steps.append(int(part))
+  return steps
+
+# Step selection: '--steps 3,4' on the command line, else mysteps from the
+# calling namespace, else all steps.
+if '--steps' in sys.argv:
+  mysteps = parse_steps(sys.argv[sys.argv.index('--steps') + 1])
+try:
+  print('List of steps to be executed ...{0}'.format(mysteps))
+  thesteps = mysteps
+except NameError:
+  print('global variable mysteps not set.')
+  thesteps = []
+unknown_steps = [s for s in thesteps if s not in step_title]
+if unknown_steps:
+  raise ValueError('Unknown steps {0}; valid steps are 0-{1}'.format(unknown_steps, len(step_title) - 1))
+if (thesteps == []):
+  thesteps = range(0, len(step_title))
+  print('Executing all steps: {0}'.format(list(thesteps)))
+
+# Calibration tables in the order they are applied, with their interpolation.
+# Each step uses the tables that precede its own and exist on disk, so a
+# selective run (mysteps = [13]) still applies everything derived earlier.
+caltable_chain = [
+  (vis_pre + '.eop', 'nearest'),
+  (vis_pre + '_smooth.accor', 'nearest'),
+  (vis_pre + '.gcal', 'nearest'),
+  (vis_pre + '.tsys', 'nearest'),
+  (vis_pre + '.sbd', 'nearest'),
+  (vis_pre + '.fringefit', 'linear'),
+  (vis_pre + '.bandpass', 'linear,linear'),
+  (vis_pre + '_smooth.acscl', 'nearest'),
+]
+
+def tables_before(table=None, exclude=()):
+  """(gaintable, interp) lists of existing tables preceding `table` in the chain."""
+  gaintables, interps = [], []
+  for tab, interp in caltable_chain:
+    if tab == table:
+      break
+    if os.path.exists(tab) and not tab.endswith(tuple(exclude)):
+      gaintables.append(tab)
+      interps.append(interp)
+  return gaintables, interps
+
+def rmtables_(*names):
+  for name in names:
+    subprocess.run(['rm', '-rf', name], check=False)
+
+def start_step(step):
+  casalog.post('Step ' + str(step) + ' ' + step_title[step], 'INFO')
+  print('Step ', step, step_title[step])
+
+# ------------------------------------------------------------
+# Imaging helpers (steps 16-17)
+# ------------------------------------------------------------
+# Mirrors vlbapipe/heuristics/imaging.py so this script needs no vlbapipe import.
+PIXELS_PER_BEAM = 6.0          # CASA Guide: Ns ~ 5-6 for VLBI
+FOV_BEAMS = 128.0              # VLBI images cannot cover the primary beam
+MAX_IMSIZE = 4096
+MTMFS_ABOVE_FRACTIONAL_BW = 0.10
+# auto-multithresh starting point for sparse, long-baseline uv coverage (not tuned).
+# The initial mask threshold is sidelobethreshold * sidelobe level * peak; VLBA
+# dirty beams have sidelobes of ~0.4-0.6, so anything above ~1.5 masks nothing.
+AUTOMASK_LONG_BASELINE = dict(sidelobethreshold=1.0, noisethreshold=5.0,
+                              lownoisethreshold=1.5, minbeamfrac=0.3,
+                              negativethreshold=0.0)
+_geometry_cache = {}
+
+def optimal_imsize(n, minimum=64):
+  """Smallest even size >= n whose prime factors are only 2, 3, 5 (FFT-friendly)."""
+  n = max(int(np.ceil(n)), minimum)
+  while True:
+    if n % 2 == 0:
+      m = n
+      for p in (2, 3, 5):
+        while m % p == 0:
+          m //= p
+      if m == 1:
+        return n
+    n += 1
+
+def imaging_geometry(msname):
+  """{'cell', 'imsize', 'fractional_bw', 'beam_mas'} for msname.
+
+  'auto' cell samples the beam (lambda/B_max at the highest frequency) with
+  PIXELS_PER_BEAM pixels; 'auto' imsize spans FOV_BEAMS beams. Explicit
+  image_cell / image_imsize values win.
+  """
+  if msname in _geometry_cache:
+    return _geometry_cache[msname]
+  md = msmetadata()
+  md.open(msname)
+  freqs = np.concatenate([md.chanfreqs(spw) for spw in range(md.nspw())])
+  md.close()
+  mt = mstool()
+  mt.open(msname)
+  max_uv_m = float(mt.range(['uvdist'])['uvdist'][1])
+  mt.close()
+
+  fmax, fmin = freqs.max(), freqs.min()
+  beam_mas = (2.99792458e8 / (max_uv_m * fmax)) * 180.0 / np.pi * 3.6e6
+  cell_mas = beam_mas / PIXELS_PER_BEAM
+  geom = {'beam_mas': beam_mas,
+          'fractional_bw': (fmax - fmin) / (0.5 * (fmax + fmin))}
+  if image_cell == 'auto':
+    geom['cell'] = '{0:.3g}mas'.format(cell_mas)
+  else:
+    geom['cell'] = image_cell
+    cell_mas = _qa.convert(image_cell, 'mas')['value']
+  if image_imsize == 'auto':
+    geom['imsize'] = min(optimal_imsize(FOV_BEAMS * beam_mas / cell_mas), MAX_IMSIZE)
+  else:
+    geom['imsize'] = int(image_imsize)
+  casalog.post('Imaging geometry for {0}: max baseline {1:.0f} m, beam ~{2:.3g} mas, '
+               'cell {3}, imsize {4}, fractional bw {5:.3f}'.format(
+                   msname, max_uv_m, beam_mas, geom['cell'], geom['imsize'],
+                   geom['fractional_bw']), 'INFO')
+  _geometry_cache[msname] = geom
+  return geom
+
+def image_stats(imagename, suffix=''):
+  # Box-free stand-in for the guide's on/off-source boxes:
+  # peak/flux from the restored image, robust rms from the residual (MAD*1.4826).
+  # suffix is '.tt0' for mtmfs images.
+  img = imstat(imagename=imagename + '.image' + suffix)
+  res = imstat(imagename=imagename + '.residual' + suffix)
+  stats = {'peak': float(img['max'][0]),
+           'flux': float(img['flux'][0]) if 'flux' in img and len(img['flux']) else np.nan,
+           'rms': float(res['medabsdevmed'][0]) * 1.4826}
+  stats['snr'] = stats['peak'] / stats['rms']
+  beam = imhead(imagename=imagename + '.image' + suffix, mode='summary').get('restoringbeam')
+  if isinstance(beam, dict) and 'major' in beam:
+    stats['bmaj_mas'] = _qa.convert(beam['major'], 'mas')['value']
+    stats['bmin_mas'] = _qa.convert(beam['minor'], 'mas')['value']
+    stats['bpa_deg'] = beam['positionangle']['value']
+  return stats
+
+def log_stats(label, stats):
+  msg = '{0}: peak={1:.4g} Jy/bm  flux={2:.4g} Jy  rms={3:.3g} Jy/bm  S/N={4:.1f}'.format(
+      label, stats['peak'], stats['flux'], stats['rms'], stats['snr'])
+  print(msg)
+  casalog.post(msg, 'INFO')
+
+
+# ============================================================
+# Import FITS-IDI data
+# ============================================================
+mystep = 0
+if (mystep in thesteps):
+  start_step(mystep)
+
+  if not os.path.exists(vis):
+    importfitsidi(fitsidifile=fitsidi_files,
+                  vis=vis,
+                  constobsid=True,
+                  scanreindexgap_s=15.0)
+
+    # TODO: ALMA runs bdflags2MS here to attach online flags. Check whether
+    # the VLBA needs an equivalent.
+
+    if not os.path.exists(vis):
+      print('ERROR in importfitsidi. Output MS is probably not useful. Will stop here.')
+      thesteps = []
+
+  # TODO: if ANTAB Tsys/gain-curve info needs to be written into the MS
+  # before gencal can read it, that conversion happens here. Depends on
+  # which ANTAB-import tool the team settles on (e.g. casavlbitools).
+
+
+# ============================================================
+# listobs and inspect metadata
+# ============================================================
+mystep = 1
+if (mystep in thesteps):
+  start_step(mystep)
+
+  rmtables_(vis_pre + '.listobs')
+  obs_dict = listobs(vis=vis, listfile=vis_pre + '.listobs')
+
+  # TODO: automatic reference-antenna selection (antennas present for most
+  # of the observation).
+  # TODO: identify a good time range for delay and bandpass calibration.
+
+
+# ============================================================
+# A priori flagging
+# ============================================================
+mystep = 2
+if (mystep in thesteps):
+  start_step(mystep)
+
+  # Quack: flag the first and last quack_interval_s seconds of each scan.
+  if quack_interval_s > 0:
+    flagdata(vis=vis, mode='quack', quackinterval=quack_interval_s,
+             quackmode='beg', quackincrement=True)
+    flagdata(vis=vis, mode='quack', quackinterval=quack_interval_s,
+             quackmode='endb', quackincrement=True)
+
+  # Automated flagging: outliers along the time axis only, which leaves the
+  # band edges for the bandpass step.
+  if tfcrop:
+    flagdata(vis=vis, mode='tfcrop', datacolumn='data',
+             timecutoff=4.0, freqcutoff=3.0, flagdimension='time',
+             action='apply', display='none')
+
+  # Known bad / non-participating antennas -- add per dataset:
+  # flagdata(vis=vis, mode='manual', antenna='<FILL IN>', flagbackup=False)
+
+  if manual_flags:
+    flagdata(vis=vis, mode='manual', spw=manual_flag_spw, flagbackup=False)
+
+  flagmanager(vis=vis, mode='save', versionname='AprioriFlags')
+
+
+# ============================================================
+# EOP corrections; opacity / ionosphere cal table (frequency-dependent)
+# ============================================================
+mystep = 3
+if (mystep in thesteps):
+  start_step(mystep)
+
+  rmtables_(vis_pre + '.opacal', vis_pre + '.eop')
+
+  # Correct Earth Orientation Parameters
+  eop_file = os.path.join(os.getcwd(), 'usno_finals.erp')
+  eop_usno_url = 'ftp://gdc.cddis.eosdis.nasa.gov/vlbi/gsfc/ancillary/solve_apriori/usno_finals.erp'
+
+  subprocess.run(['rm', '-f', eop_file], check=False)
+  subprocess.run(['curl', '-f', '-u', 'anonymous:dummy@gmail.com', '--ftp-ssl',
+                  eop_usno_url, '-o', eop_file], check=False)
+
+  if not os.path.exists(eop_file):
+    print('ERROR in downloading the EOP file from online database. Skipping EOP correction')
+  else:
+    gencal(vis=vis, caltable=vis_pre + '.eop', caltype='eop', infile=eop_file)
+    # TODO: plot and add to the weblog
+
+  # Branch per heuristics/opacity.py: the ionosphere dominates below ~4.5 GHz
+  # (TEC-based, gencal caltype='tecim'); the troposphere/opacity dominates
+  # above ~15 GHz (no native DELZN-equivalent term -- open gap). 4.5-15 GHz
+  # is unresolved and flagged rather than guessed.
+  if obs_freq_ghz is not None and obs_freq_ghz < 4.5:
+    # gencal(vis=vis, caltable=vis_pre + '.opacal', caltype='tecim',
+    #        infile='<FILL IN IONEX file>')
+    print('Ionospheric regime (<4.5 GHz): TODO wire up gencal caltype=tecim')
+  elif obs_freq_ghz is not None and obs_freq_ghz >= 15.0:
+    print('Tropospheric/opacity regime (>=15 GHz): NOT IMPLEMENTED -- '
+          'no DELZN-equivalent term available. Table intentionally not generated.')
+  else:
+    print('Unresolved regime (4.5-15 GHz) or obs_freq_ghz unset: '
+          'no opacity/ionosphere table generated.')
+
+
+# ============================================================
+# Autocorrelation, Tsys and gain-curve calibration
+# ============================================================
+mystep = 4
+if (mystep in thesteps):
+  start_step(mystep)
+
+  rmtables_(vis_pre + '.accor', vis_pre + '_smooth.accor',
+            vis_pre + '.tsys', vis_pre + '.gcal')
+
+  # NOTE: for EVN observations the Tsys and gain curves come from ANTAB
+  # files, not the FITS-IDI file, and must be appended before importfitsidi.
+
+  # Amplitude corrections from autocorrelations (sampler errors)
+  gaintables, interps = tables_before(vis_pre + '_smooth.accor')
+  accor(vis=vis, caltable=vis_pre + '.accor', solint='30s',
+        gaintable=gaintables, interp=interps)
+  # TODO: plot
+
+  # Smooth like the AIPS VLBACCOR default (30 min median)
+  smoothcal(vis=vis, tablein=vis_pre + '.accor', caltable=vis_pre + '_smooth.accor',
+            smoothtype='median', smoothtime=1800.0)
+  # TODO: plot
+
+  # A priori system temperature calibration
+  gencal(vis=vis, caltable=vis_pre + '.tsys', caltype='tsys', uniform=False)
+  # TODO: plot; automated flagging of extreme Tsys solutions
+
+  # Gain curve
+  gencal(vis=vis, caltable=vis_pre + '.gcal', caltype='gc')
+
+
+# ============================================================
+# Antenna position cal table
+# ============================================================
+mystep = 5
+if (mystep in thesteps):
+  start_step(mystep)
+
+  rmtables_(vis_pre + '.antpos')
+  # Usually small for the VLBA; may matter more for ngVLA-LBA baselines.
+  if antpos:
+    print('antpos=True but antenna-position corrections are not wired into '
+          'the calibration chain yet; skipping.')
+    # gencal(vis=vis, caltable=vis_pre + '.antpos', caltype='antpos')
+
+
+# ============================================================
+# Save flags before fringefit
+# ============================================================
+mystep = 6
+if (mystep in thesteps):
+  start_step(mystep)
+
+  flagmanager(vis=vis, mode='save', versionname='BeforeFringefit')
+
+
+# ============================================================
+# Instrumental Delay Calibration
+# ============================================================
+mystep = 7
+if (mystep in thesteps):
+  start_step(mystep)
+
+  rmtables_(vis_pre + '.sbd')
+
+  # TODO: identify a good time range for the instrumental delay automatically
+  gaintables, interps = tables_before(vis_pre + '.sbd')
+  fringefit(vis=vis, caltable=vis_pre + '.sbd', field=CALIBRATE_DELAY,
+            timerange=sbd_timerange, solint='inf', zerorates=True,
+            refant=refant, minsnr=10, gaintable=gaintables,
+            interp=interps, parang=True)
+  # TODO: plot
+
+
+# ============================================================
+# Global fringe fitting (delay + rate) on calibrators
+# ============================================================
+mystep = 8
+if (mystep in thesteps):
+  start_step(mystep)
+
+  rmtables_(vis_pre + '.fringefit')
+  # TODO: field/scan should come from calibrator_assign.py
+  gaintables, interps = tables_before(vis_pre + '.fringefit')
+  fringefit(vis=vis,
+            caltable=vis_pre + '.fringefit',
+            field=','.join(np.unique([CALIBRATE_DELAY, CALIBRATE_BANDPASS, CALIBRATE_PHASE])),
+            solint='inf',        # PLACEHOLDER -- see heuristics/fringefit.py TODO
+            refant=refant,
+            minsnr=5.0,          # PLACEHOLDER
+            zerorates=True,
+            gaintable=gaintables,
+            interp=interps,
+            parang=True)
+  # TODO: plot
+
+
+# ============================================================
+# Apply priorcals + fringefit to calibrator(s)
+# ============================================================
+mystep = 9
+if (mystep in thesteps):
+  start_step(mystep)
+
+  gaintables, interps = tables_before(vis_pre + '.bandpass')
+  applycal(vis=vis, gaintable=gaintables, interp=interps, parang=True)
+
+
+# ============================================================
+# Save flags before bandpass cal
+# ============================================================
+mystep = 10
+if (mystep in thesteps):
+  start_step(mystep)
+
+  flagmanager(vis=vis, mode='save', versionname='BeforeBandpassCalibration')
+
+
+# ============================================================
+# Bandpass calibration
+# ============================================================
+mystep = 11
+if (mystep in thesteps):
+  start_step(mystep)
+
+  rmtables_(vis_pre + '.bandpass')
+  # TODO: field should come from calibrator_assign.py's bandpass_cal
+  gaintables, interps = tables_before(vis_pre + '.bandpass')
+  bandpass(vis=vis,
+           caltable=vis_pre + '.bandpass',
+           field=CALIBRATE_BANDPASS,
+           solint='inf',         # PLACEHOLDER -- see heuristics/bandpass.py TODO
+           combine='scan',
+           refant=refant,
+           solnorm=True,
+           bandtype='B',
+           gaintable=gaintables,
+           interp=interps,
+           parang=True)
+  # TODO: plot; flag bandpass edge channels
+
+
+# ============================================================
+# Save flags before applycal
+# ============================================================
+mystep = 12
+if (mystep in thesteps):
+  start_step(mystep)
+
+  flagmanager(vis=vis, mode='save', versionname='BeforeApplycal')
+
+
+# ============================================================
+# Application of fringefit + bandpass cal tables to all fields
+# ============================================================
+mystep = 13
+if (mystep in thesteps):
+  start_step(mystep)
+
+  # TODO: per-intent applycal (calibrator / phase-ref / target) once
+  # calibrator_assign.py output is wired in.
+  gaintables, interps = tables_before(vis_pre + '_smooth.acscl')
+  applycal(vis=vis, gaintable=gaintables, interp=interps,
+           parang=True, flagbackup=False)
+
+
+# ============================================================
+# Final Amplitude Scaling and Flux Calibration
+# ============================================================
+mystep = 14
+if (mystep in thesteps):
+  start_step(mystep)
+
+  rmtables_(vis_pre + '.acscl', vis_pre + '_smooth.acscl')
+
+  # NOTE: DO NOT APPLY THE SYSTEM TEMPERATURE OR GAIN CURVE TABLES WHEN
+  # DERIVING THESE SOLUTIONS.
+  gaintables, interps = tables_before(vis_pre + '_smooth.acscl',
+                                      exclude=('.tsys', '.gcal'))
+  accor(vis=vis, caltable=vis_pre + '.acscl', solint='2min',
+        gaintable=gaintables, interp=interps)
+  # TODO: plot
+
+  smoothcal(vis=vis, tablein=vis_pre + '.acscl',
+            caltable=vis_pre + '_smooth.acscl', smoothtype='median',
+            smoothtime=1800.0)
+  # TODO: plot
+
+  gaintables, interps = tables_before()
+  applycal(vis=vis, gaintable=gaintables, interp=interps,
+           parang=True, flagbackup=False)
+
+
+# ============================================================
+# Split out calibrated data
+# ============================================================
+mystep = 15
+if (mystep in thesteps):
+  start_step(mystep)
+
+  rmtables_(cal_vis, cal_vis + '.flagversions')
+  split(vis=vis,
+        field=','.join(np.unique([CALIBRATE_DELAY, CALIBRATE_BANDPASS,
+                                  CALIBRATE_PHASE, OBSERVE_TARGET])),
+        antenna='*&*',
+        outputvis=cal_vis,
+        datacolumn='corrected',
+        keepflags=True)
+
+
+# ============================================================
+# Self-Calibration of Science Target or Phase Reference Calibrator
+# ============================================================
+mystep = 16
+if (mystep in thesteps):
+  start_step(mystep)
+
+  # TODO: S/N heuristic to decide whether the science target is bright
+  # enough to self-calibrate directly.
+  geom = imaging_geometry(cal_vis)
+  imsize = [geom['imsize']]
+  cell = [geom['cell']]
+  stokes = 'I'
+  deconvolver = 'clark'
+  weighting = 'natural'
+  niter = 1000
+  interactive = False
+  savemodel = 'modelcolumn'
+  usemask = 'auto-multithresh'
+
+  # Self-cal rounds on the phase-ref calibrator (CASA Guide sequence):
+  #   K  'inf'    -> refine residual delays
+  #   G  'inf' p  -> refine phases per scan
+  #   G  '20s' p  -> refine phases (2 solutions per ~40s phase-cal scan)
+  #   G  'inf' ap -> amplitude+phase, normalised (closure amps need 4 bl/ant)
+  # Each round solves on top of all previous rounds' tables.
+  pcal_selfcal_rounds = [
+      {'name': 'dcal',  'gaintype': 'K', 'calmode': 'p',  'solint': 'inf', 'minblperant': 3, 'solnorm': False},
+      {'name': 'pcal',  'gaintype': 'G', 'calmode': 'p',  'solint': 'inf', 'minblperant': 3, 'solnorm': False},
+      {'name': 'pcal',  'gaintype': 'G', 'calmode': 'p',  'solint': '20s', 'minblperant': 3, 'solnorm': False},
+      {'name': 'apcal', 'gaintype': 'G', 'calmode': 'ap', 'solint': 'inf', 'minblperant': 4, 'solnorm': True},
+  ]
+
+  def run_tclean(field, imagename, savemodel):
+    subprocess.run('rm -rf ' + imagename + '.*', shell=True, check=False)
+    tclean(vis=cal_vis, field=field, imagename=imagename,
+           imsize=imsize, cell=cell, stokes=stokes, deconvolver=deconvolver,
+           weighting=weighting, niter=niter, interactive=interactive,
+           savemodel=savemodel, usemask=usemask)
+
+  if phase_ref_target:
+    # Image and self-calibrate the phase-ref calibrator, then transfer the
+    # solutions to the science target.
+    pcal_name = CALIBRATE_PHASE.replace('+', 'p').replace('-', 'm')
+    img_prefix = pcal_name + '_pcal_sc'
+
+    # Initial model (no self-cal applied) -> MODEL_DATA
+    run_tclean(CALIBRATE_PHASE, img_prefix + '0', savemodel)
+    stats_hist = [image_stats(img_prefix + '0')]
+    log_stats('pcal sc0 (pre-selfcal)', stats_hist[-1])
+
+    selfcal_tables = []
+    for i, rnd in enumerate(pcal_selfcal_rounds, start=1):
+      # Round number in the name keeps repeated round types from overwriting
+      caltab = '{0}_pcal_sc{1}.{2}'.format(vis_pre, i, rnd['name'])
+      rmtables_(caltab)
+
+      gaincal(vis=cal_vis, field=CALIBRATE_PHASE, caltable=caltab,
+              solint=rnd['solint'], refant=refant, minblperant=rnd['minblperant'],
+              gaintype=rnd['gaintype'], calmode=rnd['calmode'], solnorm=rnd['solnorm'],
+              gaintable=selfcal_tables, interp=['linear'] * len(selfcal_tables),
+              parang=False)
+      selfcal_tables.append(caltab)
+
+      applycal(vis=cal_vis, field=CALIBRATE_PHASE, gaintable=selfcal_tables,
+               interp=['linear'] * len(selfcal_tables), parang=False)
+
+      # Re-image; only keep writing MODEL_DATA if another round will use it
+      last_round = (i == len(pcal_selfcal_rounds))
+      imagename = img_prefix + str(i)
+      run_tclean(CALIBRATE_PHASE, imagename, 'none' if last_round else savemodel)
+      stats_hist.append(image_stats(imagename))
+      log_stats('pcal sc{0} ({1})'.format(i, rnd['name']), stats_hist[-1])
+
+      # Sanity checks from the CASA Guide: rms should drop; be suspicious of
+      # >10% flux jumps without a matching rms improvement.
+      prev, cur = stats_hist[-2], stats_hist[-1]
+      if cur['rms'] > prev['rms']:
+        casalog.post('Self-cal round {0} did not lower the rms ({1:.3g} -> {2:.3g}); '
+                     'inspect {3}'.format(rnd['name'], prev['rms'], cur['rms'], caltab), 'WARN')
+      if (np.isfinite(prev['flux']) and cur['flux'] > 1.1 * prev['flux']
+          and cur['rms'] > 0.9 * prev['rms']):
+        casalog.post('Flux rose >10% without a clear rms drop after {0}; '
+                     'self-cal may be building in structure'.format(rnd['name']), 'WARN')
+
+    # Apply calibration to science target
+    applycal(vis=cal_vis, field=OBSERVE_TARGET, gaintable=selfcal_tables,
+             interp=['linear'] * len(selfcal_tables),
+             applymode='calonly', parang=False)
+
+    # Split out the science target
+    rmtables_(target_vis, target_vis + '.flagversions')
+    split(vis=cal_vis, outputvis=target_vis, field=OBSERVE_TARGET,
+          datacolumn='corrected', keepflags=True)
+  else:
+    # TODO: self-calibrate the science target directly (phase-only rounds,
+    # solint 'inf' -> '60s' -> '30s'), then split it out.
+    print('phase_ref_target=False: direct target self-cal is not implemented yet.')
+
+
+# ============================================================
+# Quicklook imaging (for checking the pipeline performance, not science-ready)
+# ============================================================
+mystep = 17
+if (mystep in thesteps):
+  start_step(mystep)
+
+  # Quicklook images: the science target always, the calibrators when
+  # quicklook_calibrators is True. The target uses the self-calibrated MS
+  # from step 16 when it exists; calibrators come from the step-15 split
+  # (its CORRECTED column holds the phase-cal self-cal if step 16 ran).
+  ql_fields = [(OBSERVE_TARGET, 'target',
+                target_vis if os.path.exists(target_vis) else cal_vis)]
+  if quicklook_calibrators:
+    roles = [(CALIBRATE_DELAY, 'fringe finder'), (CALIBRATE_BANDPASS, 'bandpass'),
+             (CALIBRATE_PHASE, 'phase-ref')]
+    for field in dict.fromkeys(f for f, _ in roles if f):
+      role = '/'.join(r for f, r in roles if f == field)
+      ql_fields.append((field, role, cal_vis))
+
+  ql_niter = 1000
+  ql_nsigma = 3.0            # clean down to 3x the residual rms
+  ql_rows = []
+  for field, role, ql_vis in ql_fields:
+    field_tag = field.replace('+', 'p').replace('-', 'm')
+    ql_image = '{0}.{1}.quicklook'.format(vis_pre, field_tag)
+    try:
+      md = msmetadata()
+      md.open(ql_vis)
+      present = field in md.fieldnames()
+      md.close()
+      if not present:
+        casalog.post('Quicklook: field {0} not in {1}; skipping'.format(field, ql_vis), 'WARN')
+        continue
+
+      geom = imaging_geometry(ql_vis)
+      mtmfs = geom['fractional_bw'] > MTMFS_ABOVE_FRACTIONAL_BW
+      suffix = '.tt0' if mtmfs else ''
+      subprocess.run('rm -rf ' + ql_image + '.*', shell=True, check=False)
+      tclean(vis=ql_vis,
+             imagename=ql_image,
+             field=field,
+             cell=[geom['cell']],
+             imsize=[geom['imsize']],
+             stokes='I',
+             specmode='mfs',
+             deconvolver='mtmfs' if mtmfs else 'clark',
+             nterms=2 if mtmfs else 1,
+             weighting='natural',
+             niter=ql_niter,
+             nsigma=ql_nsigma,
+             usemask='auto-multithresh',
+             interactive=False,
+             savemodel='none',
+             **AUTOMASK_LONG_BASELINE)
+
+      exportfits(imagename=ql_image + '.image' + suffix,
+                 fitsimage=ql_image + '.image.fits', overwrite=True)
+      stats = image_stats(ql_image, suffix)
+      log_stats('Quicklook {0} ({1})'.format(field, role), stats)
+      ql_rows.append((field, role, ql_vis, ql_image + '.image' + suffix, stats))
+    except Exception as e:
+      # One bad field should not cost the others their images
+      casalog.post('Quicklook imaging of {0} failed: {1}'.format(field, e), 'SEVERE')
+      print('Quicklook imaging of {0} failed: {1}'.format(field, e))
+
+  # Summary table for checking pipeline performance
+  ql_summary = vis_pre + '.quicklook_summary.txt'
+  with open(ql_summary, 'w') as f:
+    f.write('# Quicklook images (not science-ready)\n')
+    f.write('# {0:<14} {1:<26} {2:>10} {3:>10} {4:>10} {5:>8} {6:>8} {7:>8} {8:>7}  {9}\n'.format(
+        'field', 'role', 'peak_Jy/bm', 'flux_Jy', 'rms_Jy/bm', 'S/N',
+        'bmaj_mas', 'bmin_mas', 'bpa_deg', 'image'))
+    for field, role, _, image, st in ql_rows:
+      f.write('{0:<16} {1:<26} {2:>10.4g} {3:>10.4g} {4:>10.3g} {5:>8.1f} {6:>8.3g} {7:>8.3g} {8:>7.1f}  {9}\n'.format(
+          field, role, st['peak'], st['flux'], st['rms'], st['snr'],
+          st.get('bmaj_mas', np.nan), st.get('bmin_mas', np.nan),
+          st.get('bpa_deg', np.nan), image))
+  print('Quicklook imaging complete: {0} of {1} fields imaged; summary in {2}'.format(
+      len(ql_rows), len(ql_fields), ql_summary))
