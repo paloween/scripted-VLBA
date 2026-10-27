@@ -11,7 +11,7 @@ A CASA script skeleton for calibrating VLBA continuum data, modeled on the ALMA 
 | `VLBA_DataReduction_Script_py.ipynb` | Original design draft (notebook). Superseded by the script template. |
 | `vlbapipe/templates/scriptForCalibration_VLBA.py` | The CASA script template (ALMA `scriptForCalibration.py` style). |
 | `vlbapipe/scriptgen.py` | Script generator behind `vlbapipe generate`. |
-| `examples/scriptForCalibration_TL016B.py` | Generated script for the TL016B test dataset. |
+| `examples/TL016B.yaml` | Config for the TL016B test dataset; generate its script with `vlbapipe generate` (generated scripts are not committed). |
 
 ## Requirements
 

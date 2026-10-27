@@ -1,8 +1,0 @@
-pyyaml
-
-[casa]
-casatasks
-casatools
-
-[test]
-pytest

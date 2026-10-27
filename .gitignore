@@ -1,8 +1,26 @@
 .venv/
-tests/
 .pytest_cache/
 VLBA_DataReduction_Script_py.ipynb
 vlba_script_test.ipynb
 notes
 usno_finals.erp
 test-data/
+
+# tests/ doubles as a CASA working directory: keep only the test code
+tests/*
+!tests/conftest.py
+!tests/test_*.py
+
+# Python and macOS build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.DS_Store
+
+# Generated per-dataset scripts (regenerate with `vlbapipe generate`).
+# Anchored so the template vlbapipe/templates/scriptForCalibration_VLBA.py stays tracked.
+/scriptForCalibration_*.py
+/examples/scriptForCalibration_*.py
+
+# CASA logs written to the launch directory
+casa-*.log
